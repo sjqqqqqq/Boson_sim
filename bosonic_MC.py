@@ -28,56 +28,34 @@ N                  = 20
 k                  = 3
 N_INTERVALS        = 10   # number of piecewise-constant intervals
 T_INTERVAL         = 1.0  # duration of each interval  (total T = 10)
-STEPS_PER_INTERVAL = 100   # Trotter steps per interval  → dt = 0.01, 1000 steps total
+STEPS_PER_INTERVAL = 100  # Trotter steps per interval  → dt = 0.01, 1000 steps total
 SEED               = 42
 
-T_TOTAL  = N_INTERVALS * T_INTERVAL          # 10
-N_STEPS  = N_INTERVALS * STEPS_PER_INTERVAL  # 200
-dt       = T_INTERVAL / STEPS_PER_INTERVAL   # 0.05
+T_TOTAL = N_INTERVALS * T_INTERVAL          # 10
+N_STEPS = N_INTERVALS * STEPS_PER_INTERVAL  # 1000
+dt      = T_INTERVAL / STEPS_PER_INTERVAL   # 0.01
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Simulation
 # ---------------------------------------------------------------------------
-def main():
-    rng = np.random.default_rng(SEED)
-
-    d    = int(comb(N + k - 1, k - 1))
-    psi0 = np.zeros(d, dtype=complex)
-    psi0[0] = 1.0
-
-    matrices        = general_functions.common_matrices(N, k)
-    Sz              = matrices["Sz"]
-    Szd             = np.diag(Sz)
-    Hopping         = matrices["Hopping"]
-    Interaction_sum = np.sum(matrices["Interaction"], axis=0)
-
-    # SQL reference
-    states_dict = general_functions.common_states(N, k)
-    sql_state   = states_dict["SQL"] / np.linalg.norm(states_dict["SQL"])
-    SQL         = general_functions.fisher_info_pure(sql_state, Sz)
-
-    # Draw random parameters — one value per interval
+def draw_parameters(rng):
     J_vals     = rng.uniform( 0.0, 1.0, N_INTERVALS)
     U_vals     = rng.uniform(-1.0, 1.0, N_INTERVALS)
     Delta_vals = rng.uniform(-1.0, 1.0, N_INTERVALS)
+    return J_vals, U_vals, Delta_vals
 
-    print(f"Piecewise-constant pulse simulation")
-    print(f"  N={N}, k={k}, d={d}, SQL={SQL:.2f}")
-    print(f"  {N_INTERVALS} intervals x {STEPS_PER_INTERVAL} steps, dt={dt}, T={T_TOTAL}")
 
-    # QFI array: one entry per time point including t=0
+def run_simulation(psi0, Sz, Hopping, Interaction_sum, J_vals, U_vals, Delta_vals):
     QFI    = np.empty(N_STEPS + 1)
     QFI[0] = general_functions.fisher_info_pure(psi0, Sz)
 
     psi  = psi0.copy()
     step = 1
-    t0   = tm.time()
 
     for iv in range(N_INTERVALS):
-        # Precompute propagators for this interval (constant within interval)
         interaction_diag = np.exp(-1j * dt * U_vals[iv]     * Interaction_sum)
-        detuning_diag    = np.exp(-1j * dt * Delta_vals[iv] * Szd)
+        detuning_diag    = np.exp(-1j * dt * Delta_vals[iv] * np.diag(Sz))
         hop_mat          = expm(-1j * dt * J_vals[iv] * Hopping)
 
         for _ in range(STEPS_PER_INTERVAL):
@@ -87,38 +65,47 @@ def main():
             QFI[step] = general_functions.fisher_info_pure(psi, Sz)
             step     += 1
 
-    print(f"Done in {tm.time()-t0:.2f}s")
+    return QFI
 
-    # -----------------------------------------------------------------------
-    # Build plotting arrays
-    # -----------------------------------------------------------------------
-    # QFI: N_STEPS+1 evenly-spaced time points  [0, dt, 2dt, ..., T_TOTAL]
-    t_qfi = np.linspace(0.0, T_TOTAL, N_STEPS + 1)
 
-    # Sample J, U, Delta at every QFI time point (piecewise constant)
-    iv_idx  = np.minimum(np.arange(N_STEPS + 1) // STEPS_PER_INTERVAL,
-                         N_INTERVALS - 1)
+def sample_parameters(J_vals, U_vals, Delta_vals):
+    """Expand interval-constant values to one entry per time step."""
+    iv_idx        = np.minimum(np.arange(N_STEPS + 1) // STEPS_PER_INTERVAL,
+                               N_INTERVALS - 1)
     J_sampled     = J_vals[iv_idx]
     U_sampled     = U_vals[iv_idx]
     Delta_sampled = Delta_vals[iv_idx]
+    return J_sampled, U_sampled, Delta_sampled
 
-    # Save text files: two columns (time, value)
-    np.savetxt("J.txt",     J_sampled,     header="J",     comments="")
-    np.savetxt("U.txt",     U_sampled,     header="U",     comments="")
-    np.savetxt("Delta.txt", Delta_sampled, header="Delta", comments="")
-    np.savetxt("QFI.txt",   QFI,           header="QFI",   comments="")
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+def save_results(J_sampled, U_sampled, Delta_sampled, QFI):
+    np.savetxt("J.txt",     J_sampled)
+    np.savetxt("U.txt",     U_sampled)
+    np.savetxt("Delta.txt", Delta_sampled)
+    np.savetxt("QFI.txt",   QFI)
     print("Saved J.txt, U.txt, Delta.txt, QFI.txt")
 
-    # Parameters: staircase — value held constant inside each interval
-    # Use N_INTERVALS+1 boundary points so plt.step covers [0, T_TOTAL]
+
+def print_table(J_sampled, U_sampled, Delta_sampled, QFI):
+    print(f"\n{'t':>4}  {'J':>8}  {'U':>8}  {'Delta':>8}  {'QFI':>10}")
+    print("-" * 46)
+    for t_int in range(N_INTERVALS + 1):
+        idx = t_int * STEPS_PER_INTERVAL
+        print(f"{t_int:>4}  {J_sampled[idx]:>8.4f}  {U_sampled[idx]:>8.4f}"
+              f"  {Delta_sampled[idx]:>8.4f}  {QFI[idx]:>10.4f}")
+
+
+def plot_results(t_qfi, J_sampled, U_sampled, Delta_sampled, QFI,
+                 J_vals, U_vals, Delta_vals, SQL):
+    # Staircase arrays for step plots
     t_step     = np.arange(N_INTERVALS + 1, dtype=float) * T_INTERVAL
     J_step     = np.append(J_vals,     J_vals[-1])
     U_step     = np.append(U_vals,     U_vals[-1])
     Delta_step = np.append(Delta_vals, Delta_vals[-1])
 
-    # -----------------------------------------------------------------------
-    # Plot
-    # -----------------------------------------------------------------------
     fig, axes = plt.subplots(4, 1, figsize=(10, 10), sharex=True)
     fig.suptitle(
         f"Piecewise-constant pulse  "
@@ -147,7 +134,6 @@ def main():
     axes[3].set_xlabel("Time")
     axes[3].legend()
 
-    # Vertical lines at interval boundaries
     for ax in axes:
         for tb in np.arange(1, N_INTERVALS) * T_INTERVAL:
             ax.axvline(tb, color="gray", lw=0.5, ls=":")
@@ -158,6 +144,44 @@ def main():
     plt.savefig("pulse_results.png", dpi=150)
     plt.show()
     print("Plot saved to pulse_results.png")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    rng = np.random.default_rng(SEED)
+
+    d    = int(comb(N + k - 1, k - 1))
+    psi0 = np.zeros(d, dtype=complex)
+    psi0[0] = 1.0
+
+    matrices        = general_functions.common_matrices(N, k)
+    Sz              = matrices["Sz"]
+    Hopping         = matrices["Hopping"]
+    Interaction_sum = np.sum(matrices["Interaction"], axis=0)
+
+    states_dict = general_functions.common_states(N, k)
+    sql_state   = states_dict["SQL"] / np.linalg.norm(states_dict["SQL"])
+    SQL         = general_functions.fisher_info_pure(sql_state, Sz)
+
+    J_vals, U_vals, Delta_vals = draw_parameters(rng)
+
+    print(f"Piecewise-constant pulse simulation")
+    print(f"  N={N}, k={k}, d={d}, SQL={SQL:.2f}")
+    print(f"  {N_INTERVALS} intervals x {STEPS_PER_INTERVAL} steps, dt={dt}, T={T_TOTAL}")
+
+    t0  = tm.time()
+    QFI = run_simulation(psi0, Sz, Hopping, Interaction_sum, J_vals, U_vals, Delta_vals)
+    print(f"Done in {tm.time()-t0:.2f}s")
+
+    t_qfi = np.linspace(0.0, T_TOTAL, N_STEPS + 1)
+    J_sampled, U_sampled, Delta_sampled = sample_parameters(J_vals, U_vals, Delta_vals)
+
+    # save_results(J_sampled, U_sampled, Delta_sampled, QFI)
+    print_table(J_sampled, U_sampled, Delta_sampled, QFI)
+    # plot_results(t_qfi, J_sampled, U_sampled, Delta_sampled, QFI,
+    #              J_vals, U_vals, Delta_vals, SQL)
 
 
 if __name__ == "__main__":
