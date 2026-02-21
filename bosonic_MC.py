@@ -25,7 +25,7 @@ import general_functions
 # Simulation parameters
 # ---------------------------------------------------------------------------
 N                  = 20
-k                  = 3
+k                  = 5
 N_INTERVALS        = 10   # number of piecewise-constant intervals
 T_INTERVAL         = 1.0  # duration of each interval  (total T = 10)
 STEPS_PER_INTERVAL = 100  # Trotter steps per interval  → dt = 0.01, 1000 steps total
