@@ -45,9 +45,9 @@ from scipy.special import comb
 # Simulation parameters
 # ---------------------------------------------------------------------------
 N                  = 20
-k                  = 5
-N_INTERVALS        = 10    # number of piecewise-constant intervals
-T_INTERVAL         = 1.0   # duration of each interval  (total T = 10)
+k                  = 2
+N_INTERVALS        = 20    # number of piecewise-constant intervals
+T_INTERVAL         = 1.0   # duration of each interval  (total T = 20)
 STEPS_PER_INTERVAL = 100   # Trotter steps per interval
 SEED               = 42
 
