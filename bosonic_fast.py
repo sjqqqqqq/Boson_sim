@@ -225,59 +225,77 @@ def sql_qfi(N, k, Sz_diag):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Worker helpers for ProcessPoolExecutor
+# (must be module-level so they are picklable)
 # ---------------------------------------------------------------------------
-def main():
-    rng = np.random.default_rng(SEED)
+_worker_state: dict = {}
 
-    # Build operators
-    print(f"Building operators  N={N}, k={k} …")
-    t0 = tm.time()
-    d, Sz_diag, interaction_diag, H_hop = build_operators(N, k)
-    t_build = tm.time() - t0
 
-    dense_gb   = d * d * 16 / 1e9
-    sparse_mb  = (H_hop.nnz * 16 + H_hop.nnz * 8) / 1e6   # values + indices
-    print(f"  d = {d:>10,}    H_hop nnz = {H_hop.nnz:>10,}   ({t_build:.3f} s)")
-    print(f"  Dense Hopping would need {dense_gb:.2f} GB; "
-          f"sparse uses {sparse_mb:.1f} MB  ({dense_gb*1e3/sparse_mb:.0f}× reduction)")
-
+def _init_worker(N_val, k_val):
+    """Called once per worker process; builds operators into process-local state."""
+    d, Sz_diag, interaction_diag, H_hop = build_operators(N_val, k_val)
     psi0    = np.zeros(d, dtype=complex)
-    psi0[0] = 1.0                               # all bosons in first mode
+    psi0[0] = 1.0
+    _worker_state.update(
+        psi0=psi0, Sz_diag=Sz_diag,
+        interaction_diag=interaction_diag, H_hop=H_hop,
+    )
 
-    SQL = sql_qfi(N, k, Sz_diag)
-    print(f"  SQL = {SQL:.4f}")
 
-    # Random piecewise-constant parameters
+def _run_one(seed):
+    """Single simulation run using worker-local operators."""
+    rng        = np.random.default_rng(seed)
     J_vals     = rng.uniform( 0.0, 1.0, N_INTERVALS)
     U_vals     = rng.uniform(-1.0, 1.0, N_INTERVALS)
     Delta_vals = rng.uniform(-1.0, 1.0, N_INTERVALS)
-
-    print(f"\nSimulation:  {N_INTERVALS} intervals × {STEPS_PER_INTERVAL} Trotter steps,  dt={dt}")
-    t0  = tm.time()
-    QFI = run_simulation(psi0, Sz_diag, interaction_diag, H_hop,
-                         J_vals, U_vals, Delta_vals)
-    t_sim = tm.time() - t0
-    print(f"Done in {t_sim:.3f} s")
-
-    # Table at interval boundaries
-    t_qfi = np.linspace(0.0, T_TOTAL, N_STEPS + 1)
-    print(f"\n{'t':>4}  {'J':>8}  {'U':>8}  {'Delta':>8}  {'QFI':>10}  {'QFI/SQL':>8}")
-    print("-" * 56)
-    for ti in range(N_INTERVALS + 1):
-        idx = ti * STEPS_PER_INTERVAL
-        iv  = min(ti, N_INTERVALS - 1)
-        print(f"{ti:>4}  {J_vals[iv]:>8.4f}  {U_vals[iv]:>8.4f}"
-              f"  {Delta_vals[iv]:>8.4f}  {QFI[idx]:>10.4f}  {QFI[idx]/SQL:>8.4f}")
-
-    # Save time series
-    np.savetxt(
-        "QFI_fast.txt",
-        np.column_stack([t_qfi, QFI]),
-        header="t  QFI",
-        comments="# ",
+    QFI = run_simulation(
+        _worker_state['psi0'], _worker_state['Sz_diag'],
+        _worker_state['interaction_diag'], _worker_state['H_hop'],
+        J_vals, U_vals, Delta_vals,
     )
-    print("\nSaved QFI_fast.txt")
+    return QFI[::STEPS_PER_INTERVAL]   # QFI at integer t=0,1,...,N_INTERVALS
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+N_RUNS   = 100
+K_VALUES = [4, 6]
+# K_VALUES = [4, 6, 8]
+
+
+def main():
+    import os
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    n_workers = os.cpu_count()
+    print(f"N={N}  N_RUNS={N_RUNS}  workers={n_workers}\n")
+
+    for k_val in K_VALUES:
+        out_dir = f"data/{k_val}-site"
+        os.makedirs(out_dir, exist_ok=True)
+
+        print(f"── k={k_val} ──")
+        t0      = tm.time()
+        results = [None] * N_RUNS
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_worker,
+            initargs=(N, k_val),
+        ) as pool:
+            futures = {pool.submit(_run_one, seed): seed for seed in range(N_RUNS)}
+            for fut in as_completed(futures):
+                results[futures[fut]] = fut.result()
+        print(f"  Done in {tm.time()-t0:.1f} s")
+
+        QFI_all = np.array(results)   # shape (N_RUNS, N_INTERVALS+1)
+        np.savetxt(
+            os.path.join(out_dir, "QFI.txt"), QFI_all,
+            header=(f"N={N} k={k_val}  "
+                    f"rows=runs(0..{N_RUNS-1})  cols=QFI at t=0,1,...,{N_INTERVALS}"),
+            comments="# ",
+        )
+        print(f"  Saved QFI.txt → {out_dir}/  (shape {QFI_all.shape})\n")
 
 
 if __name__ == "__main__":
