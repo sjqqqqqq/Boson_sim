@@ -15,13 +15,13 @@ for k, color in zip(sites, colors):
                 color=color, linewidth=2, label=f"k={k} (run {best_run})")
 
 N = 20
-ax.axhline(N*2**2, color='gray', linestyle='--', linewidth=1.5, label="SQL2")
-ax.axhline(N*4**2, color='gray', linestyle='--', linewidth=1.5, label="SQL4")
-ax.axhline(N*6**2, color='gray', linestyle='--', linewidth=1.5, label="SQL6")
+ax.axhline(N*(2-1)**2, color='blue', linestyle='--', linewidth=1.5, label="SQL2")
+ax.axhline(N*(4-1)**2, color='orange', linestyle='--', linewidth=1.5, label="SQL4")
+ax.axhline(N*(6-1)**2, color='green', linestyle='--', linewidth=1.5, label="SQL6")
 
 ax.set_xlabel("Time", fontsize=13)
 ax.set_ylabel("QFI (log scale)", fontsize=13)
-ax.set_title("Best QFI vs Time (N=20, highest final QFI of 20 runs)", fontsize=14)
+ax.set_title("Best QFI vs Time (N=20, highest final QFI of 100 runs)", fontsize=14)
 ax.set_xlim(0, 20)
 ax.legend(fontsize=12)
 ax.grid(True, which='both', alpha=0.3)
