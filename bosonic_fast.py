@@ -18,12 +18,29 @@ THREE CHANGES
 ─────────────
 1. Sparse H_hop (CSR) — O(nnz) memory, never forms the dense matrix.
 
-2. Per Trotter step, apply exp(-i·dt·J·H_hop)|ψ⟩ via a Taylor series.
-   Since ‖J·H_hop‖·dt ≤ 0.4, 15 terms suffice for double precision.
+2. Per Trotter step, apply exp(-i·dt·H)|ψ⟩ via a Taylor series.
+   Since ‖J·H‖·dt ≤ 0.4, 15 terms suffice for double precision.
    No scipy call overhead — just 15 sparse matvecs per step.
 
 3. QFI = 4(⟨Sz²⟩ − ⟨Sz⟩²) via dot products with Sz_diag² and Sz_diag
    — O(d) per step, not O(d²) as with the dense Sz matrix.
+
+TROTTER DECOMPOSITION  (Eq. 16-17 of arXiv:2511.15805)
+────────────────────────────────────────────────────────
+Each piecewise-constant interval k uses three Hamiltonians applied sequentially:
+
+  H1^(k) = Σ_i [ Δ_i^(k) n̂_i  +  U_i^(k) n̂_i(n̂_i−1) ]      diagonal
+  H2^(k) = Σ_i  J_{2i}^(k)   (â†_{2i+1} â_{2i} + h.c.)        even-bond hops
+  H3^(k) = Σ_i  J_{2i-1}^(k) (â†_{2i}   â_{2i-1} + h.c.)      odd-bond hops
+
+  |ψ⟩ ← exp(-iΔt H3^(k)) exp(-iΔt H2^(k)) exp(-iΔt H1^(k)) |ψ⟩
+
+Even bonds (0→1, 2→3, …) and odd bonds (1→2, 3→4, …) are applied in
+separate steps so that each group has independently tunable J couplings.
+Parameters Δ_i, U_i are per-site; J_b is per-bond — all drawn uniformly:
+  J_b    ∈ [0, 1]    (Algorithm 1, line 5)
+  Δ_i    ∈ [−1, 1]   (Algorithm 1, line 6)
+  U_i    ∈ [−1, 1]   (Algorithm 1, line 7)
 
 SCALING (N=20, same physics/accuracy as bosonic_MC.py)
 ───────────────────────────────────────────────────────
@@ -81,49 +98,59 @@ def make_basis(N, k):
 # Sparse operator construction
 # ---------------------------------------------------------------------------
 def build_operators(N, k):
-    """Build diagonal observables and the sparse hopping matrix.
+    """Build diagonal observables and per-bond sparse hopping matrices.
 
     Returns
     -------
-    d                : int    — Hilbert-space dimension C(N+k-1, k-1)
-    Sz_diag          : (d,) float64 — diagonal of Sz
-    interaction_diag : (d,) float64 — Σ_l n_l(n_l−1) per basis state
-    H_hop            : (d,d) CSR float64 — nearest-neighbor hopping
+    d          : int          — Hilbert-space dimension C(N+k-1, k-1)
+    Sz_diag    : (d,) float64 — diagonal of Sz  (used for QFI)
+    site_n     : (k, d) float64 — site_n[i, idx] = occupation n_i of basis state idx
+    site_inter : (k, d) float64 — site_inter[i, idx] = n_i(n_i-1)
+    H_bond     : list of (k-1) CSR float64 matrices — H_bond[b] = hopping on bond b
+    even_bonds : list of int — indices of even bonds: 0, 2, 4, …
+    odd_bonds  : list of int — indices of odd bonds:  1, 3, 5, …
     """
     Basis, Ind = make_basis(N, k)
     d = len(Basis)
 
-    # Sz diagonal:  Σ_l n_l · (l − (k−1)/2)
+    # Sz diagonal:  Σ_l n_l · (l − (k−1)/2)  — used only for QFI
     weights = np.arange(k, dtype=float) - (k - 1) / 2.0
     Sz_diag = np.array([np.dot(weights, b) for b in Basis])
 
-    # Interaction diagonal:  Σ_l n_l(n_l − 1)
-    interaction_diag = np.array(
-        [sum(b[l] * (b[l] - 1) for l in range(k)) for b in Basis],
-        dtype=float,
-    )
+    # Per-site occupation numbers  (k, d)
+    # site_n[i, idx] = Basis[idx][i]
+    site_n = np.array([[b[i] for b in Basis] for i in range(k)], dtype=float)
 
-    # Sparse hopping:  H_{i,j} = sqrt(n_site · (n_{site+1} + 1))
-    # for each nearest-neighbor pair (site, site+1) and each basis state i.
-    rows, cols, vals = [], [], []
-    for i, occ in enumerate(Basis):
-        for site in range(k - 1):
+    # Per-site n(n-1)  (k, d)
+    # site_inter[i, idx] = n_i * (n_i - 1)
+    site_inter = np.array([[b[i] * (b[i] - 1) for b in Basis] for i in range(k)], dtype=float)
+
+    # Build one sparse hopping matrix per bond (k-1 matrices)
+    # H_bond[b]_{i,j} = sqrt(n_b * (n_{b+1}+1))  for the hop  b→b+1
+    H_bond = []
+    for site in range(k - 1):
+        rows, cols, vals = [], [], []
+        for i, occ in enumerate(Basis):
             if occ[site] == 0:          # no boson to hop
                 continue
-            occ2          = occ[:]      # copy list of Python ints
+            occ2          = occ[:]      # copy
             occ2[site]   -= 1
             occ2[site+1] += 1
-            j   = Ind[str(occ2)]        # index of connected state
+            j   = Ind[str(occ2)]
             amp = np.sqrt(occ[site] * occ2[site + 1])
-            rows += [i, j]              # H is Hermitian → add both entries
+            rows += [i, j]              # Hermitian → both entries
             cols += [j, i]
             vals += [amp, amp]
+        H_b = sp.csr_matrix((vals, (rows, cols)), shape=(d, d), dtype=np.float64)
+        H_b.sum_duplicates()
+        H_bond.append(H_b)
 
-    H_hop = sp.csr_matrix(
-        (vals, (rows, cols)), shape=(d, d), dtype=np.float64
-    )
-    H_hop.sum_duplicates()   # consolidate any repeated (row, col) pairs
-    return d, Sz_diag, interaction_diag, H_hop
+    # Even bonds: 0→1, 2→3, 4→5, …   (H2 in Eq. 16)
+    # Odd  bonds: 1→2, 3→4, 5→6, …   (H3 in Eq. 16)
+    even_bonds = list(range(0, k - 1, 2))
+    odd_bonds  = list(range(1, k - 1, 2))
+
+    return d, Sz_diag, site_n, site_inter, H_bond, even_bonds, odd_bonds
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +171,7 @@ def _expm_mv_taylor(A_sparse, v, order=15):
     """Compute exp(A)·v via Taylor series.
 
     Safe for ‖A‖ ≤ 0.5 with order=15:  error ≈ 0.5^16/16! ≈ 8×10⁻¹⁹.
-    For our hopping step, ‖A‖ = J·‖H_hop‖·dt.  Since ‖H_hop‖ grows
+    For our hopping steps, ‖A‖ = J·‖H_bond‖·dt.  Since ‖H_bond‖ grows
     slowly with k (≈28 for k=3, ≈37 for k=6), dt=0.01 keeps ‖A‖ ≤ 0.4
     throughout, well within the convergence regime.
 
@@ -159,28 +186,39 @@ def _expm_mv_taylor(A_sparse, v, order=15):
 
 
 # ---------------------------------------------------------------------------
-# Time evolution
+# Time evolution  (Eq. 16-17 of arXiv:2511.15805)
 # ---------------------------------------------------------------------------
-def run_simulation(psi0, Sz_diag, interaction_diag, H_hop,
+def run_simulation(psi0, Sz_diag, site_n, site_inter, H_bond, even_bonds, odd_bonds,
                    J_vals, U_vals, Delta_vals):
-    """Trotter evolution with sparse Taylor-series hopping steps.
+    """Trotter evolution following Eq. 16-17: H1 → H2 → H3 per sub-step.
 
-    Within each piecewise-constant interval:
-      1. Precompute:
-           diag_phase = exp(-i·dt·(U·Σn(n-1) + Δ·Sz))   [O(d), elementwise]
-           hop_A      = -i·dt·J·H_hop                    [O(nnz), sparse]
-      2. Repeat STEPS_PER_INTERVAL times:
-           ψ ← diag_phase * ψ                            [O(d)]
-           ψ ← Taylor_exp(hop_A) · ψ                    [O(order·nnz)]
-           QFI ← 4(⟨Sz²⟩ - ⟨Sz⟩²)                     [O(d)]
+    Parameters
+    ----------
+    psi0       : (d,) complex — initial state
+    Sz_diag    : (d,) float  — Sz eigenvalues (for QFI)
+    site_n     : (k, d) float — per-site occupation numbers
+    site_inter : (k, d) float — per-site n(n-1) values
+    H_bond     : list of (k-1) CSR matrices — per-bond hopping
+    even_bonds : list of int — even-bond indices (H2 group)
+    odd_bonds  : list of int — odd-bond  indices (H3 group)
+    J_vals     : (N_INTERVALS, k-1) float — J per bond per interval ∈ [0,1]
+    U_vals     : (N_INTERVALS, k)   float — U per site per interval ∈ [−1,1]
+    Delta_vals : (N_INTERVALS, k)   float — Δ per site per interval ∈ [−1,1]
 
-    Why Taylor instead of scipy.expm_multiply:
-      ‖hop_A‖ = J·‖H_hop‖·dt ≤ 1 × ~20 × 0.01 = 0.2
-      At this norm, expm_multiply needs ~5 matvecs but carries ~5 ms of
-      scipy/Python setup overhead per call.  With 1000 calls, that is
-      ~5 s of overhead alone.  The Taylor series uses 15 matvecs per call
-      but has negligible overhead — only NumPy sparse-dot invocations.
+    Within each piecewise-constant interval iv:
+      1. Build H1 diagonal = Σ_i (Δ_i n_i + U_i n_i(n_i-1))      [O(k·d)]
+         → diag_phase = exp(−i·dt·H1_diag)                        [O(d)]
+      2. Build H2 = Σ_{even b} J_b H_bond[b]                      [O(nnz)]
+         → hop_A2 = −i·dt·H2                                      [sparse]
+      3. Build H3 = Σ_{odd b} J_b H_bond[b]                       [O(nnz)]
+         → hop_A3 = −i·dt·H3                                      [sparse]
+      4. Repeat STEPS_PER_INTERVAL times:
+           ψ ← diag_phase * ψ               H1: detuning+interaction  O(d)
+           ψ ← Taylor_exp(hop_A2) · ψ       H2: even-bond hopping     O(15·nnz)
+           ψ ← Taylor_exp(hop_A3) · ψ       H3: odd-bond  hopping     O(15·nnz)
+           record QFI
     """
+    d        = len(psi0)
     Sz_diag2 = Sz_diag ** 2
     QFI      = np.empty(N_STEPS + 1)
     QFI[0]   = qfi_pure(psi0, Sz_diag, Sz_diag2)
@@ -188,20 +226,40 @@ def run_simulation(psi0, Sz_diag, interaction_diag, H_hop,
     psi  = psi0.copy()
     step = 1
 
-    for iv in range(N_INTERVALS):
-        # Diagonal Trotter factor: exp(-i·dt·(U·n(n-1) + Δ·Sz)) [once per interval]
-        diag_phase = np.exp(
-            -1j * dt * (U_vals[iv] * interaction_diag
-                        + Delta_vals[iv] * Sz_diag)
-        )
-        # Hopping generator -i·dt·J·H_hop  [sparse scalar-multiply, O(nnz)]
-        hop_A = (-1j * dt * float(J_vals[iv])) * H_hop
+    zero_csr = sp.csr_matrix((d, d), dtype=np.float64)
 
+    for iv in range(N_INTERVALS):
+        # ── H1: diagonal  Σ_i (Δ_i n_i + U_i n_i(n_i-1)) ──────────────────
+        H1_diag    = Delta_vals[iv] @ site_n + U_vals[iv] @ site_inter
+        diag_phase = np.exp(-1j * dt * H1_diag)
+
+        # ── H2: even-bond hopping  Σ_{even b} J_b H_bond[b] ─────────────────
+        if even_bonds:
+            H2 = zero_csr.copy()
+            for idx, b in enumerate(even_bonds):
+                H2 = H2 + float(J_vals[iv, b]) * H_bond[b]
+            hop_A2 = (-1j * dt) * H2
+        else:
+            hop_A2 = None
+
+        # ── H3: odd-bond hopping   Σ_{odd b} J_b H_bond[b] ──────────────────
+        if odd_bonds:
+            H3 = zero_csr.copy()
+            for idx, b in enumerate(odd_bonds):
+                H3 = H3 + float(J_vals[iv, b]) * H_bond[b]
+            hop_A3 = (-1j * dt) * H3
+        else:
+            hop_A3 = None
+
+        # ── Trotter sub-steps ─────────────────────────────────────────────────
         for _ in range(STEPS_PER_INTERVAL):
-            psi        = diag_phase * psi               # diagonal step   O(d)
-            psi        = _expm_mv_taylor(hop_A, psi)   # hopping step   O(15·nnz)
-            QFI[step]  = qfi_pure(psi, Sz_diag, Sz_diag2)
-            step      += 1
+            psi = diag_phase * psi                      # H1: diagonal phase   O(d)
+            if hop_A2 is not None:
+                psi = _expm_mv_taylor(hop_A2, psi)      # H2: even-bond hops
+            if hop_A3 is not None:
+                psi = _expm_mv_taylor(hop_A3, psi)      # H3: odd-bond  hops
+            QFI[step] = qfi_pure(psi, Sz_diag, Sz_diag2)
+            step += 1
 
     return QFI
 
@@ -233,24 +291,43 @@ _worker_state: dict = {}
 
 def _init_worker(N_val, k_val):
     """Called once per worker process; builds operators into process-local state."""
-    d, Sz_diag, interaction_diag, H_hop = build_operators(N_val, k_val)
+    d, Sz_diag, site_n, site_inter, H_bond, even_bonds, odd_bonds = build_operators(N_val, k_val)
     psi0    = np.zeros(d, dtype=complex)
     psi0[0] = 1.0
     _worker_state.update(
-        psi0=psi0, Sz_diag=Sz_diag,
-        interaction_diag=interaction_diag, H_hop=H_hop,
+        k=k_val,
+        psi0=psi0,
+        Sz_diag=Sz_diag,
+        site_n=site_n,
+        site_inter=site_inter,
+        H_bond=H_bond,
+        even_bonds=even_bonds,
+        odd_bonds=odd_bonds,
     )
 
 
 def _run_one(seed):
-    """Single simulation run using worker-local operators."""
+    """Single simulation run using worker-local operators.
+
+    Samples per-bond J and per-site Δ, U according to Algorithm 1:
+      J_b    ∈ [0, 1]   for b = 0, …, k-2
+      Δ_i    ∈ [−1, 1]  for i = 0, …, k-1
+      U_i    ∈ [−1, 1]  for i = 0, …, k-1
+    """
+    k_val      = _worker_state['k']
+    n_bonds    = k_val - 1
     rng        = np.random.default_rng(seed)
-    J_vals     = rng.uniform( 0.0, 1.0, N_INTERVALS)
-    U_vals     = rng.uniform(-1.0, 1.0, N_INTERVALS)
-    Delta_vals = rng.uniform(-1.0, 1.0, N_INTERVALS)
+    J_vals     = rng.uniform( 0.0, 1.0, (N_INTERVALS, n_bonds))
+    U_vals     = rng.uniform(-1.0, 1.0, (N_INTERVALS, k_val))
+    Delta_vals = rng.uniform(-1.0, 1.0, (N_INTERVALS, k_val))
     QFI = run_simulation(
-        _worker_state['psi0'], _worker_state['Sz_diag'],
-        _worker_state['interaction_diag'], _worker_state['H_hop'],
+        _worker_state['psi0'],
+        _worker_state['Sz_diag'],
+        _worker_state['site_n'],
+        _worker_state['site_inter'],
+        _worker_state['H_bond'],
+        _worker_state['even_bonds'],
+        _worker_state['odd_bonds'],
         J_vals, U_vals, Delta_vals,
     )
     return QFI[::STEPS_PER_INTERVAL]   # QFI at integer t=0,1,...,N_INTERVALS
@@ -259,8 +336,8 @@ def _run_one(seed):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-N_RUNS   = 20
-K_VALUES = [4, 6, 8]
+N_RUNS   = 100
+K_VALUES = [2, 4, 6]
 
 
 def main():
