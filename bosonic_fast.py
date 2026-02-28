@@ -61,7 +61,7 @@ from scipy.special import comb
 # ---------------------------------------------------------------------------
 # Simulation parameters
 # ---------------------------------------------------------------------------
-N                  = 20
+N                  = 200
 k                  = 2
 N_INTERVALS        = 20    # number of piecewise-constant intervals
 T_INTERVAL         = 1.0   # duration of each interval  (total T = 20)
@@ -337,7 +337,7 @@ def _run_one(seed):
 # Main
 # ---------------------------------------------------------------------------
 N_RUNS   = 100
-K_VALUES = [2, 4, 6, 8]
+K_VALUES = [2, 4, 6]
 
 
 def main():
