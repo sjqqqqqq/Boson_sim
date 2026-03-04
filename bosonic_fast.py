@@ -61,16 +61,12 @@ from scipy.special import comb
 # ---------------------------------------------------------------------------
 # Simulation parameters
 # ---------------------------------------------------------------------------
-N                  = 100
-k                  = 2
-N_INTERVALS        = 20    # number of piecewise-constant intervals
-T_INTERVAL         = 1.0   # duration of each interval  (total T = 20)
-STEPS_PER_INTERVAL = 100   # Trotter steps per interval
-SEED               = 42
-
-T_TOTAL = N_INTERVALS * T_INTERVAL
-N_STEPS = N_INTERVALS * STEPS_PER_INTERVAL
-dt      = T_INTERVAL / STEPS_PER_INTERVAL
+N    = 20
+k    = 2
+T    = 20.0   # total evolution time
+n    = 100    # number of piecewise-constant intervals (Algorithm 1 step 1)
+dt   = 1e-2  # Trotter sub-step size
+SEED = 42
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +197,9 @@ def run_simulation(psi0, Sz_diag, site_n, site_inter, H_bond, even_bonds, odd_bo
     H_bond     : list of (k-1) CSR matrices — per-bond hopping
     even_bonds : list of int — even-bond indices (H2 group)
     odd_bonds  : list of int — odd-bond  indices (H3 group)
-    J_vals     : (N_INTERVALS, k-1) float — J per bond per interval ∈ [0,1]
-    U_vals     : (N_INTERVALS, k)   float — U per site per interval ∈ [−1,1]
-    Delta_vals : (N_INTERVALS, k)   float — Δ per site per interval ∈ [−1,1]
+    J_vals     : (n, k-1) float — J per bond per interval ∈ [0,1]
+    U_vals     : (n, k)   float — U per site per interval ∈ [−1,1]
+    Delta_vals : (n, k)   float — Δ per site per interval ∈ [−1,1]
 
     Within each piecewise-constant interval iv:
       1. Build H1 diagonal = Σ_i (Δ_i n_i + U_i n_i(n_i-1))      [O(k·d)]
@@ -216,19 +212,18 @@ def run_simulation(psi0, Sz_diag, site_n, site_inter, H_bond, even_bonds, odd_bo
            ψ ← diag_phase * ψ               H1: detuning+interaction  O(d)
            ψ ← Taylor_exp(hop_A2) · ψ       H2: even-bond hopping     O(15·nnz)
            ψ ← Taylor_exp(hop_A3) · ψ       H3: odd-bond  hopping     O(15·nnz)
-           record QFI
+        record QFI at end of interval
     """
-    d        = len(psi0)
-    Sz_diag2 = Sz_diag ** 2
-    QFI      = np.empty(N_STEPS + 1)
-    QFI[0]   = qfi_pure(psi0, Sz_diag, Sz_diag2)
+    d            = len(psi0)
+    Sz_diag2     = Sz_diag ** 2
+    steps_per_iv = int(round(T / (n * dt)))
+    QFI          = np.empty(n + 1)
+    QFI[0]       = qfi_pure(psi0, Sz_diag, Sz_diag2)
 
-    psi  = psi0.copy()
-    step = 1
-
+    psi      = psi0.copy()
     zero_csr = sp.csr_matrix((d, d), dtype=np.float64)
 
-    for iv in range(N_INTERVALS):
+    for iv in range(n):
         # ── H1: diagonal  Σ_i (Δ_i n_i + U_i n_i(n_i-1)) ──────────────────
         H1_diag    = Delta_vals[iv] @ site_n + U_vals[iv] @ site_inter
         diag_phase = np.exp(-1j * dt * H1_diag)
@@ -252,14 +247,13 @@ def run_simulation(psi0, Sz_diag, site_n, site_inter, H_bond, even_bonds, odd_bo
             hop_A3 = None
 
         # ── Trotter sub-steps ─────────────────────────────────────────────────
-        for _ in range(STEPS_PER_INTERVAL):
+        for _ in range(steps_per_iv):
             psi = diag_phase * psi                      # H1: diagonal phase   O(d)
             if hop_A2 is not None:
                 psi = _expm_mv_taylor(hop_A2, psi)      # H2: even-bond hops
             if hop_A3 is not None:
                 psi = _expm_mv_taylor(hop_A3, psi)      # H3: odd-bond  hops
-            QFI[step] = qfi_pure(psi, Sz_diag, Sz_diag2)
-            step += 1
+        QFI[iv + 1] = qfi_pure(psi, Sz_diag, Sz_diag2)
 
     return QFI
 
@@ -317,9 +311,9 @@ def _run_one(seed):
     k_val      = _worker_state['k']
     n_bonds    = k_val - 1
     rng        = np.random.default_rng(seed)
-    J_vals     = rng.uniform( 0.0, 1.0, (N_INTERVALS, n_bonds))
-    U_vals     = rng.uniform(-1.0, 1.0, (N_INTERVALS, k_val))
-    Delta_vals = rng.uniform(-1.0, 1.0, (N_INTERVALS, k_val))
+    J_vals     = rng.uniform( 0.0, 1.0, (n, n_bonds))
+    U_vals     = rng.uniform(-1.0, 1.0, (n, k_val))
+    Delta_vals = rng.uniform(-1.0, 1.0, (n, k_val))
     QFI = run_simulation(
         _worker_state['psi0'],
         _worker_state['Sz_diag'],
@@ -330,7 +324,7 @@ def _run_one(seed):
         _worker_state['odd_bonds'],
         J_vals, U_vals, Delta_vals,
     )
-    return QFI[::STEPS_PER_INTERVAL]   # QFI at integer t=0,1,...,N_INTERVALS
+    return QFI   # shape (n+1,) — QFI at t=0, T/n, …, T
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +339,7 @@ def main():
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     n_workers = os.cpu_count()
-    print(f"N={N}  N_RUNS={N_RUNS}  workers={n_workers}\n")
+    print(f"N={N}  T={T}  n={n}  N_RUNS={N_RUNS}  workers={n_workers}\n")
 
     for k_val in K_VALUES:
         out_dir = f"data/{k_val}-site"
@@ -364,11 +358,11 @@ def main():
                 results[futures[fut]] = fut.result()
         print(f"  Done in {tm.time()-t0:.1f} s")
 
-        QFI_all = np.array(results)   # shape (N_RUNS, N_INTERVALS+1)
+        QFI_all = np.array(results)   # shape (N_RUNS, n+1)
         np.savetxt(
             os.path.join(out_dir, "QFI.txt"), QFI_all,
-            header=(f"N={N} k={k_val}  "
-                    f"rows=runs(0..{N_RUNS-1})  cols=QFI at t=0,1,...,{N_INTERVALS}"),
+            header=(f"N={N} k={k_val} T={T} n={n}  "
+                    f"rows=runs(0..{N_RUNS-1})  cols=QFI at t=0,T/n,...,T"),
             comments="# ",
         )
         print(f"  Saved QFI.txt → {out_dir}/  (shape {QFI_all.shape})\n")
