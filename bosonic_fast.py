@@ -33,7 +33,7 @@ Each piecewise-constant interval k uses three Hamiltonians applied sequentially:
   H2^(k) = Σ_i  J_{2i}^(k)   (â†_{2i+1} â_{2i} + h.c.)        even-bond hops
   H3^(k) = Σ_i  J_{2i-1}^(k) (â†_{2i}   â_{2i-1} + h.c.)      odd-bond hops
 
-  |ψ⟩ ← exp(-iΔt H3^(k)) exp(-iΔt H2^(k)) exp(-iΔt H1^(k)) |ψ⟩
+  |ψ⟩ ← exp(-i·dt H3^(k)) exp(-i·dt H2^(k)) exp(-i·dt H1^(k)) |ψ⟩
 
 Even bonds (0→1, 2→3, …) and odd bonds (1→2, 3→4, …) are applied in
 separate steps so that each group has independently tunable J couplings.
@@ -64,7 +64,7 @@ from scipy.special import comb
 N    = 20
 k    = 2
 T    = 20.0   # total evolution time
-n    = 100    # number of piecewise-constant intervals (Algorithm 1 step 1)
+n    = 20    # number of piecewise-constant intervals (Algorithm 1 step 1)
 dt   = 1e-2  # Trotter sub-step size
 SEED = 42
 
@@ -186,7 +186,7 @@ def _expm_mv_taylor(A_sparse, v, order=15):
 # ---------------------------------------------------------------------------
 def run_simulation(psi0, Sz_diag, site_n, site_inter, H_bond, even_bonds, odd_bonds,
                    J_vals, U_vals, Delta_vals):
-    """Trotter evolution following Eq. 16-17: H1 → H2 → H3 per sub-step.
+    """Cycling evolution: H1 only on [0,Δt], H2 only on [Δt,2Δt], H3 only on [2Δt,3Δt], …
 
     Parameters
     ----------
@@ -197,62 +197,55 @@ def run_simulation(psi0, Sz_diag, site_n, site_inter, H_bond, even_bonds, odd_bo
     H_bond     : list of (k-1) CSR matrices — per-bond hopping
     even_bonds : list of int — even-bond indices (H2 group)
     odd_bonds  : list of int — odd-bond  indices (H3 group)
-    J_vals     : (n, k-1) float — J per bond per interval ∈ [0,1]
-    U_vals     : (n, k)   float — U per site per interval ∈ [−1,1]
-    Delta_vals : (n, k)   float — Δ per site per interval ∈ [−1,1]
+    J_vals     : (n,) float — global J per interval ∈ [0,1]   (same for all bonds)
+    U_vals     : (n,) float — global U per interval ∈ [−1,1]  (same for all sites)
+    Delta_vals : (n,) float — global Δ per interval ∈ [−1,1]  (same for all sites)
 
-    Within each piecewise-constant interval iv:
-      1. Build H1 diagonal = Σ_i (Δ_i n_i + U_i n_i(n_i-1))      [O(k·d)]
-         → diag_phase = exp(−i·dt·H1_diag)                        [O(d)]
-      2. Build H2 = Σ_{even b} J_b H_bond[b]                      [O(nnz)]
-         → hop_A2 = −i·dt·H2                                      [sparse]
-      3. Build H3 = Σ_{odd b} J_b H_bond[b]                       [O(nnz)]
-         → hop_A3 = −i·dt·H3                                      [sparse]
-      4. Repeat STEPS_PER_INTERVAL times:
-           ψ ← diag_phase * ψ               H1: detuning+interaction  O(d)
-           ψ ← Taylor_exp(hop_A2) · ψ       H2: even-bond hopping     O(15·nnz)
-           ψ ← Taylor_exp(hop_A3) · ψ       H3: odd-bond  hopping     O(15·nnz)
-        record QFI at end of interval
+    Within each piecewise-constant interval iv, the three Hamiltonians are
+    applied in turn for T/(3n) each, subdivided into steps of size dt:
+      Slot 1 (H1 only): repeat steps_per_iv times:
+           ψ ← exp(−i·dt·H1_diag) * ψ        detuning+interaction  O(d)
+      Slot 2 (H2 only): repeat steps_per_iv times:
+           ψ ← Taylor_exp(−i·dt·H2) · ψ      even-bond hopping     O(15·nnz)
+      Slot 3 (H3 only): repeat steps_per_iv times:
+           ψ ← Taylor_exp(−i·dt·H3) · ψ      odd-bond  hopping     O(15·nnz)
+      record QFI after all three slots
     """
     d            = len(psi0)
     Sz_diag2     = Sz_diag ** 2
-    steps_per_iv = int(round(T / (n * dt)))
+    steps_per_iv = int(round(T / (3 * n * dt)))  # sub-steps per T/(3n) slot
     QFI          = np.empty(n + 1)
     QFI[0]       = qfi_pure(psi0, Sz_diag, Sz_diag2)
 
-    psi      = psi0.copy()
-    zero_csr = sp.csr_matrix((d, d), dtype=np.float64)
+    # Precompute site sums for global (uniform) parameters
+    site_n_total     = site_n.sum(axis=0)      # (d,) — total occupation (= N always)
+    site_inter_total = site_inter.sum(axis=0)  # (d,) — total n(n-1) across sites
+
+    # Precompute bond-summed hopping matrices (scaled per interval by scalar J)
+    H2_base = sum(H_bond[b] for b in even_bonds) if even_bonds else None
+    H3_base = sum(H_bond[b] for b in odd_bonds)  if odd_bonds  else None
+
+    psi = psi0.copy()
 
     for iv in range(n):
-        # ── H1: diagonal  Σ_i (Δ_i n_i + U_i n_i(n_i-1)) ──────────────────
-        H1_diag    = Delta_vals[iv] @ site_n + U_vals[iv] @ site_inter
+        # ── Slot 1: H1 only — diagonal detuning + interaction ────────────────
+        H1_diag    = Delta_vals[iv] * site_n_total + U_vals[iv] * site_inter_total
         diag_phase = np.exp(-1j * dt * H1_diag)
-
-        # ── H2: even-bond hopping  Σ_{even b} J_b H_bond[b] ─────────────────
-        if even_bonds:
-            H2 = zero_csr.copy()
-            for idx, b in enumerate(even_bonds):
-                H2 = H2 + float(J_vals[iv, b]) * H_bond[b]
-            hop_A2 = (-1j * dt) * H2
-        else:
-            hop_A2 = None
-
-        # ── H3: odd-bond hopping   Σ_{odd b} J_b H_bond[b] ──────────────────
-        if odd_bonds:
-            H3 = zero_csr.copy()
-            for idx, b in enumerate(odd_bonds):
-                H3 = H3 + float(J_vals[iv, b]) * H_bond[b]
-            hop_A3 = (-1j * dt) * H3
-        else:
-            hop_A3 = None
-
-        # ── Trotter sub-steps ─────────────────────────────────────────────────
         for _ in range(steps_per_iv):
-            psi = diag_phase * psi                      # H1: diagonal phase   O(d)
-            if hop_A2 is not None:
-                psi = _expm_mv_taylor(hop_A2, psi)      # H2: even-bond hops
-            if hop_A3 is not None:
-                psi = _expm_mv_taylor(hop_A3, psi)      # H3: odd-bond  hops
+            psi = diag_phase * psi
+
+        # ── Slot 2: H2 only — even-bond hopping ──────────────────────────────
+        if H2_base is not None:
+            hop_A2 = (-1j * dt * float(J_vals[iv])) * H2_base
+            for _ in range(steps_per_iv):
+                psi = _expm_mv_taylor(hop_A2, psi)
+
+        # ── Slot 3: H3 only — odd-bond hopping ───────────────────────────────
+        if H3_base is not None:
+            hop_A3 = (-1j * dt * float(J_vals[iv])) * H3_base
+            for _ in range(steps_per_iv):
+                psi = _expm_mv_taylor(hop_A3, psi)
+
         QFI[iv + 1] = qfi_pure(psi, Sz_diag, Sz_diag2)
 
     return QFI
@@ -303,17 +296,15 @@ def _init_worker(N_val, k_val):
 def _run_one(seed):
     """Single simulation run using worker-local operators.
 
-    Samples per-bond J and per-site Δ, U according to Algorithm 1:
-      J_b    ∈ [0, 1]   for b = 0, …, k-2
-      Δ_i    ∈ [−1, 1]  for i = 0, …, k-1
-      U_i    ∈ [−1, 1]  for i = 0, …, k-1
+    Samples one global J, U, Δ per interval (same value applied to all bonds/sites):
+      J      ∈ [0, 1]   (global hopping strength)
+      Δ      ∈ [−1, 1]  (global detuning)
+      U      ∈ [−1, 1]  (global interaction strength)
     """
-    k_val      = _worker_state['k']
-    n_bonds    = k_val - 1
     rng        = np.random.default_rng(seed)
-    J_vals     = rng.uniform( 0.0, 1.0, (n, n_bonds))
-    U_vals     = rng.uniform(-1.0, 1.0, (n, k_val))
-    Delta_vals = rng.uniform(-1.0, 1.0, (n, k_val))
+    J_vals     = rng.uniform( 0.0, 1.0, n)
+    U_vals     = rng.uniform(-1.0, 1.0, n)
+    Delta_vals = rng.uniform(-1.0, 1.0, n)
     QFI = run_simulation(
         _worker_state['psi0'],
         _worker_state['Sz_diag'],
@@ -330,8 +321,8 @@ def _run_one(seed):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-N_RUNS   = 10
-K_VALUES = [2, 4, 6]
+N_RUNS   = 20
+K_VALUES = [2, 4, 6, 8]
 
 
 def main():
