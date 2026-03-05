@@ -344,7 +344,8 @@ def main():
             initializer=_init_worker,
             initargs=(N, k_val),
         ) as pool:
-            futures = {pool.submit(_run_one, seed): seed for seed in range(N_RUNS)}
+            base = K_VALUES.index(k_val) * N_RUNS
+            futures = {pool.submit(_run_one, base + seed): seed for seed in range(N_RUNS)}
             for fut in as_completed(futures):
                 results[futures[fut]] = fut.result()
         print(f"  Done in {tm.time()-t0:.1f} s")
