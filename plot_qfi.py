@@ -1,8 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-sites = [2, 4, 6, 8]
-colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+sites = [2, 4, 6]
+# sites = [2, 4, 6, 8]
+colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
+# colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
 t = np.linspace(0, 20, 21)  # t = 0, T/n, ..., T  (n=100 intervals)
 
 fig, ax = plt.subplots(figsize=(5, 6))

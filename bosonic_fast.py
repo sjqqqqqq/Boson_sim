@@ -66,7 +66,6 @@ k    = 2
 T    = 20.0   # total evolution time
 n    = 20    # number of piecewise-constant intervals (Algorithm 1 step 1)
 dt   = 1e-2  # Trotter sub-step size
-SEED = 42
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +322,7 @@ def _run_one(seed):
 # ---------------------------------------------------------------------------
 N_RUNS   = 100
 # K_VALUES = [2, 4, 6, 8]
-K_VALUES = [8]
+K_VALUES = [6]
 
 
 def main():
